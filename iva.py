@@ -5,11 +5,9 @@ import csv
 import time
 import json
 import torch
-import string
-import random
 import PIL.Image
 import numpy as np
-from collections import deque
+import utils
 from operator import itemgetter
 from sklearn.utils.linear_assignment_ import linear_assignment
 
@@ -19,59 +17,10 @@ import trt_pose.coco
 import trt_pose.models
 from torch2trt import TRTModule
 import torchvision.transforms as transforms
-from trt_pose.parse_objects import ParseObjects
-from trt_pose.draw_objects import DrawObjects
+from pose import *
 
-model_w = 224
-model_h = 224
 
-ASSET_DIR = 'models/'
-OPTIMIZED_MODEL = ASSET_DIR + 'resnet18_baseline_att_224x224_A_epoch_249_trt.pth'
 
-body_labels = {0:'nose', 1: 'lEye', 2: 'rEye', 3:'lEar', 4:'rEar', 5:'lShoulder', 6:'rShoulder',
-               7:'lElbow', 8:'rElbow', 9:'lWrist', 10:'rWrist', 11:'lHip', 12:'rHip', 13:'lKnee', 14:'rKnee',
-              15:'lAnkle', 16:'rAnkle', 17:'neck'}
-body_idx = dict([[v,k] for k,v in body_labels.items()])
-
-with open(ASSET_DIR + 'human_pose.json', 'r') as f:
-    human_pose = json.load(f)
-
-model_trt = TRTModule()
-model_trt.load_state_dict(torch.load(OPTIMIZED_MODEL))
-
-mean = torch.Tensor([0.485, 0.456, 0.406]).cuda()
-std = torch.Tensor([0.229, 0.224, 0.225]).cuda()
-device = torch.device('cuda')
-
-topology = trt_pose.coco.coco_category_to_topology(human_pose)
-parse_objects = ParseObjects(topology)
-draw_objects = DrawObjects(topology)
-
-def id_gen(size=6, chars=string.ascii_uppercase + string.digits):
-    '''
-    https://pythontips.com/2013/07/28/generating-a-random-string/
-    input: id_gen(3, "6793YUIO")
-    output: 'Y3U'
-    '''
-    return ''.join(random.choice(chars) for x in range(size))
-
-def preprocess(image):
-    global device
-    device = torch.device('cuda')
-    image = cv2.resize(image, (model_h, model_w))
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    image = PIL.Image.fromarray(image)
-    image = transforms.functional.to_tensor(image).to(device)
-    image.sub_(mean[:, None, None]).div_(std[:, None, None])
-    return image[None, ...]
-
-def inference(image):
-    data = preprocess(image)
-    cmap, paf = model_trt(data)
-    cmap, paf = cmap.detach().cpu(), paf.detach().cpu()
-    counts, objects, peaks = parse_objects(cmap, paf) #, cmap_threshold=0.15, link_threshold=0.15)
-    body_dict = draw_objects(image, counts, objects, peaks)
-    return image, body_dict
 
 def IOU(boxA, boxB):
     # pyimagesearch: determine the (x, y)-coordinates of the intersection rectangle
@@ -152,37 +101,6 @@ def tracker_match(trackers, detections, iou_thrd = 0.3):
 
     return matches, np.array(unmatched_detections), np.array(unmatched_trackers)
 
-class PersonTracker(object):
-    def __init__(self):
-        self.id = id_gen() #int(time.time() * 1000)
-        self.q = deque(maxlen=10)
-        return
-
-    def set_bbox(self, bbox):
-        self.bbox = bbox
-        x1, y1, x2, y2 = bbox
-        self.h = 1e-6 + x2 - x1
-        self.w = 1e-6 + y2 - y1
-        self.centroid = tuple(map(int, ( x1 + self.h / 2, y1 + self.w / 2)))
-        return
-
-    def update_pose(self, pose_dict):
-        ft_vec = np.zeros(2 * len(body_labels))
-        for ky in pose_dict:
-            idx = body_idx[ky]
-            ft_vec[2 * idx: 2 * (idx + 1)] = 2 * (np.array(pose_dict[ky]) - np.array(self.centroid)) / np.array((self.h, self.w))
-        self.q.append(ft_vec)
-        return
-
-    def annotate(self, image):
-        x1, y1, x2, y2 = self.bbox
-        image = cv2.rectangle(image, (x1, y1), (x2, y2), (0, 0, 255), 3)
-        image = cv2.putText(image, self.activity, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-        image = cv2.drawMarker(image, self.centroid, (255, 0, 0), 0, 30, 4)
-        return image
-
-
-
 source = sys.argv[1]
 source = int(source) if source.isdigit() else source
 cap = cv2.VideoCapture(source)
@@ -197,7 +115,7 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
 
 DEBUG = True
 WRITE2CSV = False
-WRITE2VIDEO = True
+WRITE2VIDEO = False
 RUNSECONDARY = True
 
 if WRITE2CSV:
@@ -213,10 +131,10 @@ if WRITE2VIDEO:
 
 if RUNSECONDARY:
     import tensorflow as tf
-    secondary_model = tf.keras.models.load_model('models/lstm_69.h5')
-    window = 3
+    secondary_model = tf.keras.models.load_model('models/lstm.h5')
+    window = 5
     pose_vec_dim = 36
-    motion_dict = {0: 'spin', 1: 'squat'}
+    motion_dict = {0: 'squat', 1: 'deadlift', 2: 'stand'}
 
 
 trackers = []
@@ -228,33 +146,17 @@ while True:
 
         image, pose_list = inference(frame)
         for body in pose_list:
-            bbox = get_bbox(list(body.values()))
-            bboxes.append((bbox, body))
+            if body:
+                bbox = get_bbox(list(body.values()))
+                bboxes.append((bbox, body))
 
-        track_boxes = [tracker.bbox for tracker in trackers]
-        matched, unmatched_trackers, unmatched_detections = tracker_match(track_boxes, [b[0] for b in bboxes])
-
-        for idx, jdx in matched:
-            trackers[idx].set_bbox(bboxes[jdx][0])
-            trackers[idx].update_pose(bboxes[jdx][1])
-
-        for idx in unmatched_detections:
-            try:
-                trackers.pop(idx)
-            except:
-                pass
-
-        for idx in unmatched_trackers:
-            person = PersonTracker()
-            person.set_bbox(bboxes[idx][0])
-            person.update_pose(bboxes[idx][1])
-            trackers.append(person)
+        trackers = utils.update_trackers(trackers, bboxes)
 
         if RUNSECONDARY:
             for tracker in trackers:
                 print(len(tracker.q))
-                if len(tracker.q) >= 3:
-                    sample = np.array(list(tracker.q)[:3])
+                if len(tracker.q) >= window:
+                    sample = np.array(list(tracker.q)[:window])
                     sample = sample.reshape(1, pose_vec_dim, window)
                     pred_activity = motion_dict[np.argmax(secondary_model.predict(sample)[0])]
                     tracker.activity = pred_activity
